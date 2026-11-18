@@ -9,6 +9,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <map>
 
 // fill the batch with tokens at consecutive positions starting from pos_0, output logits only for the last one
 static void batch_set_tokens(llama_batch_ext * batch, const llama_token * tokens, int32_t n_tokens, llama_pos pos_0) {
@@ -56,6 +57,35 @@ static std::string format_chat(const llama_model * model, const std::vector<chat
         throw std::runtime_error("Chat template formatting failed");
     }
     return std::string(buffer.data(), written);
+}
+
+// 一条候选路线
+struct beam {
+    std::vector<llama_token> toks;  // 这条路已经写了哪些 token
+    std::string              text;  // 对应的文字
+    double                   score; // 每步 log 概率之和
+    llama_sampler *          grmr;  // 每条路自己的语法状态
+};
+
+// 笨方法：清空记忆，把「提示词 + 这条路的 token」从头算一遍，返回最后一个位置的 logits
+static const float * eval_from_scratch(llama_context * ctx, llama_batch_ext * batch,
+                                       const std::vector<llama_token> & prompt,
+                                       const std::vector<llama_token> & toks) {
+    // 把 prompt 和 toks 拼成一个 vector all
+    std::vector<llama_token> all;
+    all.reserve(prompt.size() + toks.size());
+    all.insert(all.end(), prompt.begin(), prompt.end());
+    all.insert(all.end(), toks.begin(), toks.end());
+
+    // 清空记忆
+    llama_memory_clear(llama_get_memory(ctx), true);
+
+    // batch_set_tokens(batch, all.data(), all.size(), 0)，再 llama_process；失败就 return nullptr
+    batch_set_tokens(batch, all.data(), all.size(), 0);
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) {
+        return nullptr;
+    }
+    return llama_get_logits_ith(ctx, -1);
 }
 
 int main(int argc, char ** argv) {
@@ -165,9 +195,9 @@ int main(int argc, char ** argv) {
 
     llama_context_params ctx_params = llama_context_default_params();
     // n_ctx is the context size
-    ctx_params.n_ctx                = n_prompt + n_predict - 1;
+    ctx_params.n_ctx                = n_prompt + n_predict;
     // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
-    ctx_params.n_batch              = n_prompt;
+    ctx_params.n_batch              = n_prompt + n_predict;
     // enable performance counters
     ctx_params.no_perf              = false;
 
@@ -208,75 +238,114 @@ int main(int argc, char ** argv) {
     // prepare a batch for the prompt
 
     llama_batch_ext * batch    = llama_batch_ext_init(ctx);
-    int               n_tokens = n_prompt;  // number of tokens in the current batch
-
-    batch_set_tokens(batch, prompt_tokens.data(), n_prompt, 0);
-
-    if (llama_model_has_encoder(model)) {
-        if (llama_process(ctx, LLAMA_PROCESS_TYPE_ENCODE, batch)) {
-            fprintf(stderr, "%s : failed to eval\n", __func__);
-            return 1;
-        }
-
-        llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
-        if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
-            decoder_start_token_id = llama_vocab_bos(vocab);
-        }
-
-        batch_set_tokens(batch, &decoder_start_token_id, 1, 0);
-        n_tokens = 1;
-    }
+    
 
     // main loop
 
     const auto t_main_start = ggml_time_us();
     int        n_decode     = 0;
 
-    for (int n_pos = 0; n_pos + n_tokens < n_prompt + n_predict;) {
-        // evaluate the current batch with the transformer model
-        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) {
-            fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
-            return 1;
-        }
+    const int K = 4;
+    std::vector<beam> live;
+    live.push_back({ {}, "", 0.0, llama_sampler_clone(grmr) });
+    std::map<std::string, double> finished;     // 文字 -> 最高分
 
-        n_pos += n_tokens;
+    struct cand {
+        double      score;   // 走到这一步的总分
+        int         parent;  // 从 live 里第几条路延申出来
+        llama_token tok;     // 这一步选的 token
+    };
 
-        // 语法约束下贪心挑一个 token
-        {
-            const float * logits  = llama_get_logits_ith(ctx, -1);
-            const int     n_vocab = llama_vocab_n_tokens(vocab);
+    while (!live.empty()) {
+        std::vector<cand> pool;
+        for (int b = 0; b < static_cast<int>(live.size()); ++b) {
+            const float * logits = eval_from_scratch(ctx, batch, prompt_tokens, live[b].toks);
+            if (logits == nullptr) {
+                fprintf(stderr, "%s: eval failed\n", __func__);
+                return 1;
+            }
+            n_decode += 1;
+            const int n_vocab = llama_vocab_n_tokens(vocab);
 
-            // 每个 token 一条 {id, 分数, 概率}，概率先填 0
+            // 语法约束之前，先算每个 token 的 log 概率
+            float max_l = logits[0];
+            for (int i = 1; i < n_vocab; ++i) {
+                max_l = std::max(max_l, logits[i]);
+            }
+            double sum = 0.0;
+            for (int i = 0; i < n_vocab; ++i) {
+                sum += std::exp(logits[i] - max_l);
+            }
+            const double log_sum = std::log(sum);
+            std::vector<double> lp(n_vocab);
+            for (int i = 0; i < n_vocab; ++i) {
+                lp[i] = logits[i] - max_l - log_sum;
+            }
+
+            // 用这条路自己的语法状态筛掉违规 token
             std::vector<llama_token_data> cur(n_vocab);
             for (int i = 0; i < n_vocab; ++i) {
-                cur[i] = { i, logits[i], 0 };
+                cur[i] = { i, logits[i], 0.0f };
             }
             llama_token_data_array arr = { cur.data(), cur.size(), -1, false };
+            llama_sampler_apply(live[b].grmr, &arr);
 
-            // 违反语法的 token，分数会被改成负无穷
-            llama_sampler_apply(grmr, &arr);
-
-            // 在 arr 里找 Logit 最大的那个元素，取出它的 token id
-            const llama_token_data * best = std::max_element(arr.data, arr.data + arr.size, 
-                [](const llama_token_data & a, const llama_token_data & b) {
-                    return a.logit < b.logit;
-                });
-            llama_token tok = best->id;
-
-            if (llama_vocab_is_eog(vocab, tok)) {
-                break;
+            // 允许的里面，按 lp 取前 K 个
+            std::vector<std::pair<double, llama_token>> ok;
+            for (int j = 0; j < static_cast<int>(arr.size); ++j) {
+                if (arr.data[j].logit != -INFINITY) {
+                    ok.push_back({ lp[arr.data[j].id], arr.data[j].id});
+                }
             }
-
-            // 用 llama_token_to_piece 把 tok 转换成文字并打印
-            char buf[128];
-            int  n = llama_token_to_piece(vocab, tok, buf, sizeof(buf), 0, true);
-            printf("'%s'\t%d\t\n", std::string(buf, n).c_str(), tok);
-
-            llama_sampler_accept(grmr, tok); // 告诉语法：这个 token 已经写好，下一步的规则跟着变
-            batch_set_tokens(batch, &tok, 1, n_pos);
-            n_tokens = 1;
-            n_decode += 1;
+            const int n_ok = std::min<int>(K, ok.size());
+            std::partial_sort(ok.begin(), ok.begin() + n_ok, ok.end(),
+                              [](const auto & x, const auto & y) {
+                                return x.first > y.first;
+                              });
+            for (int j = 0; j < n_ok; ++j) {
+                pool.push_back({ live[b].score + ok[j].first, b, ok[j].second });
+            }
         }
+
+        // 所有路的候选合在一起，按总分排序
+        std::sort(pool.begin(), pool.end(), 
+                  [](const cand & x, const cand & y) { 
+                    return x.score > y.score; 
+                });
+
+        std::vector<beam> next;
+        for (int c = 0; c < std::min<int>(K, pool.size()); ++c) {
+            const beam & p = live[pool[c].parent];
+            if (llama_vocab_is_eog(vocab, pool[c].tok)) {
+                auto it = finished.find(p.text);
+                if (it == finished.end() || it->second < pool[c].score) {
+                    finished[p.text] = pool[c].score;
+                }
+            } else {
+                beam nb;
+                nb.toks = p.toks;
+                nb.toks.push_back(pool[c].tok);
+                char buf[128];
+                const int n = llama_token_to_piece(vocab, pool[c].tok, buf, sizeof(buf), 0, true);
+                nb.text = p.text + std::string(buf, n);
+                nb.score = pool[c].score;
+                nb.grmr = llama_sampler_clone(p.grmr);
+                llama_sampler_accept(nb.grmr, pool[c].tok);
+                next.push_back(std::move(nb));
+            }
+        }
+
+        for (auto & b : live) {
+            llama_sampler_free(b.grmr);
+        }
+        live = std::move(next);
+    }
+
+    // 打印前 K 个已完成的
+    std::vector<std::pair<std::string, double>> out(finished.begin(), finished.end());
+    std::sort(out.begin(), out.end(), [](const auto & x, const auto & y) {return x.second > y.second; });
+    for (int i = 0; i < static_cast<int>(out.size()) && i < static_cast<int>(K); ++i) {
+        printf("%s\t%.2f\n", out[i].first.c_str(), out[i].second);
     }
 
     printf("\n");
