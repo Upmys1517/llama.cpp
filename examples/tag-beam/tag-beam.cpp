@@ -4,6 +4,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <cmath>
+#include <utility>
 
 // fill the batch with tokens at consecutive positions starting from pos_0, output logits only for the last one
 static void batch_set_tokens(llama_batch_ext * batch, const llama_token * tokens, int32_t n_tokens, llama_pos pos_0) {
@@ -179,7 +182,6 @@ int main(int argc, char ** argv) {
 
     const auto t_main_start = ggml_time_us();
     int n_decode = 0;
-    llama_token new_token_id;
 
     for (int n_pos = 0; n_pos + n_tokens < n_prompt + n_predict; ) {
         // evaluate the current batch with the transformer model
@@ -190,30 +192,40 @@ int main(int argc, char ** argv) {
 
         n_pos += n_tokens;
 
-        // sample the next token
+        // 打印下一个 token 的前 5 名
         {
-            new_token_id = llama_sampler_sample(smpl, ctx, -1);
+           const float * logits = llama_get_logits_ith(ctx, -1);
+           const int n_vocab = llama_vocab_n_tokens(vocab);
 
-            // is it an end of generation?
-            if (llama_vocab_is_eog(vocab, new_token_id)) {
-                break;
+           // 遍历 logits，找出最大分数 max_l
+           float max_l = logits[0];
+           for (int i = 1; i < n_vocab; ++i) {
+                max_l = std::max(max_l, logits[i]);
+           }
+
+           // 分母 sum = 所有 exp(logits[i] - max_l) 加起来（用 double 累加，精度更好）
+           double sum = 0.0;
+           for (int i = 0; i < n_vocab; ++i) {
+                sum += std::exp(logits[i] - max_l);
+           }
+
+           // 前 5 名：把 (分数, id) 都放进去，只排前 5 个
+           std::vector<std::pair<float, llama_token>> cand;
+           for (int i = 0; i < n_vocab; ++i) {
+                cand.push_back({logits[i], i});
+           }
+           std::partial_sort(cand.begin(), cand.begin() + 5, cand.end(),
+                             [](const auto & a, const auto & b) {
+                                return a.first > b.first;
+                             });
+            
+            for (int k = 0; k < 5; ++k) {
+                char buf[128];
+                int n = llama_token_to_piece(vocab, cand[k].second, buf, sizeof(buf), 0, true);
+                double p = std::exp(cand[k].first - max_l) / sum;
+                printf("'%s'\t%d\t%.4f\n", std::string(buf, n).c_str(), cand[k].second, p);
             }
-
-            char buf[128];
-            int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
-            if (n < 0) {
-                fprintf(stderr, "%s: error: failed to convert token to piece\n", __func__);
-                return 1;
-            }
-            std::string s(buf, n);
-            printf("%s", s.c_str());
-            fflush(stdout);
-
-            // prepare the next batch with the sampled token
-            batch_set_tokens(batch, &new_token_id, 1, n_pos);
-            n_tokens = 1;
-
-            n_decode += 1;
+            break; // 只看下一个 token，打印完就跳出循环
         }
     }
 
