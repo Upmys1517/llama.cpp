@@ -1,18 +1,20 @@
 #include "llama.h"
+
+#include <algorithm>
 #include <clocale>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <string>
-#include <vector>
-#include <algorithm>
-#include <cmath>
 #include <utility>
+#include <vector>
 
 // fill the batch with tokens at consecutive positions starting from pos_0, output logits only for the last one
 static void batch_set_tokens(llama_batch_ext * batch, const llama_token * tokens, int32_t n_tokens, llama_pos pos_0) {
     llama_batch_ext_clear(batch);
     for (int32_t i = 0; i < n_tokens; ++i) {
-        const int32_t idx = llama_batch_ext_add_token(batch, 0, tokens[i]);
+        const int32_t   idx = llama_batch_ext_add_token(batch, 0, tokens[i]);
         const llama_pos pos = pos_0 + i;
         llama_batch_ext_set_pos(batch, idx, &pos);
     }
@@ -25,17 +27,48 @@ static void print_usage(int, char ** argv) {
     printf("\n");
 }
 
+struct chat_message {
+    std::string role;
+    std::string content;
+};
+
+static std::string format_chat(const llama_model * model, const std::vector<chat_message> & history) {
+    const char * tmpl = llama_model_chat_template(model, nullptr);
+    if (!tmpl) {
+        throw std::runtime_error("The model has no default chat template");
+    }
+
+    std::vector<llama_chat_message> messages;
+    messages.reserve(history.size());
+    for (const auto & message : history) {
+        messages.push_back({ message.role.c_str(), message.content.c_str() });
+    }
+
+    const int32_t required = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, nullptr, 0);
+    if (required <= 0) {
+        throw std::runtime_error("Chat template is unsupported or produced an empty prompt");
+    }
+
+    std::vector<char> buffer(required);
+    const int32_t     written =
+        llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, buffer.data(), required);
+    if (written != required) {
+        throw std::runtime_error("Chat template formatting failed");
+    }
+    return std::string(buffer.data(), written);
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
     // path to the model gguf file
     std::string model_path;
     // prompt to generate text from
-    std::string prompt = "Hello my name is";
+    std::string prompt    = "Hello my name is";
     // number of layers to offload to the GPU
-    int ngl = 99;
+    int         ngl       = 99;
     // number of tokens to predict
-    int n_predict = 32;
+    int         n_predict = 32;
 
     // parse command line arguments
 
@@ -96,16 +129,25 @@ int main(int argc, char ** argv) {
     // initialize the model
 
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = ngl;
+    model_params.n_gpu_layers       = ngl;
 
     llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
 
     if (model == NULL) {
-        fprintf(stderr , "%s: error: unable to load model\n" , __func__);
+        fprintf(stderr, "%s: error: unable to load model\n", __func__);
         return 1;
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    // 把命令行输入的中文当作 user 消息，套上聊天模板
+    const std::string  sys = "把中文测试场景名翻译成英文 TAG：只用大写字母和数字，不超过 16 个字符。只输出 TAG。";
+    const chat_message system_message = { "system", sys };
+    std::vector<chat_message> history = {
+        system_message, { "user", prompt }
+    };
+    prompt = format_chat(model, history);
+
     // tokenize the prompt
 
     // find the number of tokens in the prompt
@@ -113,7 +155,8 @@ int main(int argc, char ** argv) {
 
     // allocate space for the tokens and tokenize the prompt
     std::vector<llama_token> prompt_tokens(n_prompt);
-    if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), prompt_tokens.data(), prompt_tokens.size(), true, true) < 0) {
+    if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), prompt_tokens.data(), prompt_tokens.size(), true, true) <
+        0) {
         fprintf(stderr, "%s: error: failed to tokenize the prompt\n", __func__);
         return 1;
     }
@@ -122,32 +165,38 @@ int main(int argc, char ** argv) {
 
     llama_context_params ctx_params = llama_context_default_params();
     // n_ctx is the context size
-    ctx_params.n_ctx = n_prompt + n_predict - 1;
+    ctx_params.n_ctx                = n_prompt + n_predict - 1;
     // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
-    ctx_params.n_batch = n_prompt;
+    ctx_params.n_batch              = n_prompt;
     // enable performance counters
-    ctx_params.no_perf = false;
+    ctx_params.no_perf              = false;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
 
     if (ctx == NULL) {
-        fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
+        fprintf(stderr, "%s: error: failed to create the llama_context\n", __func__);
         return 1;
     }
 
     // initialize the sampler
 
-    auto sparams = llama_sampler_chain_default_params();
-    sparams.no_perf = false;
+    auto sparams         = llama_sampler_chain_default_params();
+    sparams.no_perf      = false;
     llama_sampler * smpl = llama_sampler_chain_init(sparams);
 
     llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+
+    llama_sampler * grmr = llama_sampler_init_grammar(vocab, "root ::= [A-Z] [A-Z0-9]{0, 15}", "root");
+    if (grmr == nullptr) {
+        fprintf(stderr, "%s: error: failed to init grmr\n", __func__);
+        return 1;
+    }
 
     // print the prompt token-by-token
 
     for (auto id : prompt_tokens) {
         char buf[128];
-        int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
+        int  n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
         if (n < 0) {
             fprintf(stderr, "%s: error: failed to convert token to piece\n", __func__);
             return 1;
@@ -158,8 +207,8 @@ int main(int argc, char ** argv) {
 
     // prepare a batch for the prompt
 
-    llama_batch_ext * batch = llama_batch_ext_init(ctx);
-    int n_tokens = n_prompt; // number of tokens in the current batch
+    llama_batch_ext * batch    = llama_batch_ext_init(ctx);
+    int               n_tokens = n_prompt;  // number of tokens in the current batch
 
     batch_set_tokens(batch, prompt_tokens.data(), n_prompt, 0);
 
@@ -181,9 +230,9 @@ int main(int argc, char ** argv) {
     // main loop
 
     const auto t_main_start = ggml_time_us();
-    int n_decode = 0;
+    int        n_decode     = 0;
 
-    for (int n_pos = 0; n_pos + n_tokens < n_prompt + n_predict; ) {
+    for (int n_pos = 0; n_pos + n_tokens < n_prompt + n_predict;) {
         // evaluate the current batch with the transformer model
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) {
             fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
@@ -192,40 +241,41 @@ int main(int argc, char ** argv) {
 
         n_pos += n_tokens;
 
-        // 打印下一个 token 的前 5 名
+        // 语法约束下贪心挑一个 token
         {
-           const float * logits = llama_get_logits_ith(ctx, -1);
-           const int n_vocab = llama_vocab_n_tokens(vocab);
+            const float * logits  = llama_get_logits_ith(ctx, -1);
+            const int     n_vocab = llama_vocab_n_tokens(vocab);
 
-           // 遍历 logits，找出最大分数 max_l
-           float max_l = logits[0];
-           for (int i = 1; i < n_vocab; ++i) {
-                max_l = std::max(max_l, logits[i]);
-           }
-
-           // 分母 sum = 所有 exp(logits[i] - max_l) 加起来（用 double 累加，精度更好）
-           double sum = 0.0;
-           for (int i = 0; i < n_vocab; ++i) {
-                sum += std::exp(logits[i] - max_l);
-           }
-
-           // 前 5 名：把 (分数, id) 都放进去，只排前 5 个
-           std::vector<std::pair<float, llama_token>> cand;
-           for (int i = 0; i < n_vocab; ++i) {
-                cand.push_back({logits[i], i});
-           }
-           std::partial_sort(cand.begin(), cand.begin() + 5, cand.end(),
-                             [](const auto & a, const auto & b) {
-                                return a.first > b.first;
-                             });
-            
-            for (int k = 0; k < 5; ++k) {
-                char buf[128];
-                int n = llama_token_to_piece(vocab, cand[k].second, buf, sizeof(buf), 0, true);
-                double p = std::exp(cand[k].first - max_l) / sum;
-                printf("'%s'\t%d\t%.4f\n", std::string(buf, n).c_str(), cand[k].second, p);
+            // 每个 token 一条 {id, 分数, 概率}，概率先填 0
+            std::vector<llama_token_data> cur(n_vocab);
+            for (int i = 0; i < n_vocab; ++i) {
+                cur[i] = { i, logits[i], 0 };
             }
-            break; // 只看下一个 token，打印完就跳出循环
+            llama_token_data_array arr = { cur.data(), cur.size(), -1, false };
+
+            // 违反语法的 token，分数会被改成负无穷
+            llama_sampler_apply(grmr, &arr);
+
+            // 在 arr 里找 Logit 最大的那个元素，取出它的 token id
+            const llama_token_data * best = std::max_element(arr.data, arr.data + arr.size, 
+                [](const llama_token_data & a, const llama_token_data & b) {
+                    return a.logit < b.logit;
+                });
+            llama_token tok = best->id;
+
+            if (llama_vocab_is_eog(vocab, tok)) {
+                break;
+            }
+
+            // 用 llama_token_to_piece 把 tok 转换成文字并打印
+            char buf[128];
+            int  n = llama_token_to_piece(vocab, tok, buf, sizeof(buf), 0, true);
+            printf("'%s'\t%d\t\n", std::string(buf, n).c_str(), tok);
+
+            llama_sampler_accept(grmr, tok); // 告诉语法：这个 token 已经写好，下一步的规则跟着变
+            batch_set_tokens(batch, &tok, 1, n_pos);
+            n_tokens = 1;
+            n_decode += 1;
         }
     }
 
@@ -233,8 +283,8 @@ int main(int argc, char ** argv) {
 
     const auto t_main_end = ggml_time_us();
 
-    fprintf(stderr, "%s: decoded %d tokens in %.2f s, speed: %.2f t/s\n",
-            __func__, n_decode, (t_main_end - t_main_start) / 1000000.0f, n_decode / ((t_main_end - t_main_start) / 1000000.0f));
+    fprintf(stderr, "%s: decoded %d tokens in %.2f s, speed: %.2f t/s\n", __func__, n_decode,
+            (t_main_end - t_main_start) / 1000000.0f, n_decode / ((t_main_end - t_main_start) / 1000000.0f));
 
     fprintf(stderr, "\n");
     llama_perf_sampler_print(smpl);
@@ -243,6 +293,7 @@ int main(int argc, char ** argv) {
 
     llama_batch_ext_free(batch);
     llama_sampler_free(smpl);
+    llama_sampler_free(grmr);
     llama_free(ctx);
     llama_model_free(model);
 
