@@ -22,6 +22,21 @@ static void batch_set_tokens(llama_batch_ext * batch, const llama_token * tokens
     llama_batch_ext_set_output_logits(batch, n_tokens - 1, true);
 }
 
+// 往 batch 里加一个 token：指定序列、位置，并要求输出它的 logits
+static int32_t batch_add_one(llama_batch_ext * batch, llama_seq_id seq, llama_token tok, llama_pos pos) {
+    const int32_t idx = llama_batch_ext_add_token(batch, seq, tok);
+    if (idx < 0) {
+        return idx;
+    }
+    if (!llama_batch_ext_set_pos(batch, idx, &pos)) {
+        return -1;
+    }
+    if (!llama_batch_ext_set_output_logits(batch, idx, true)) {
+        return -1;
+    }
+    return idx;
+}
+
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
     printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [prompt]\n", argv[0]);
@@ -61,32 +76,14 @@ static std::string format_chat(const llama_model * model, const std::vector<chat
 
 // 一条候选路线
 struct beam {
-    std::vector<llama_token> toks;  // 这条路已经写了哪些 token
-    std::string              text;  // 对应的文字
-    double                   score; // 每步 log 概率之和
-    llama_sampler *          grmr;  // 每条路自己的语法状态
+    std::string              text;          // 对应的文字
+    double                   score;         // 每步 log 概率之和
+    llama_sampler *          grmr;          // 每条路自己的语法状态
+    llama_seq_id             seq;           // 它在 KV cache 里的编号
+    llama_pos                next_pos;      // 下一个 token 该放的位置（= 提示词长度 + 已写 token 数）
+    const float*             logits;        // 指向最近一次算出的分数（下次 decode 前生效）
 };
 
-// 笨方法：清空记忆，把「提示词 + 这条路的 token」从头算一遍，返回最后一个位置的 logits
-static const float * eval_from_scratch(llama_context * ctx, llama_batch_ext * batch,
-                                       const std::vector<llama_token> & prompt,
-                                       const std::vector<llama_token> & toks) {
-    // 把 prompt 和 toks 拼成一个 vector all
-    std::vector<llama_token> all;
-    all.reserve(prompt.size() + toks.size());
-    all.insert(all.end(), prompt.begin(), prompt.end());
-    all.insert(all.end(), toks.begin(), toks.end());
-
-    // 清空记忆
-    llama_memory_clear(llama_get_memory(ctx), true);
-
-    // batch_set_tokens(batch, all.data(), all.size(), 0)，再 llama_process；失败就 return nullptr
-    batch_set_tokens(batch, all.data(), all.size(), 0);
-    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) {
-        return nullptr;
-    }
-    return llama_get_logits_ith(ctx, -1);
-}
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
@@ -99,6 +96,8 @@ int main(int argc, char ** argv) {
     int         ngl       = 99;
     // number of tokens to predict
     int         n_predict = 32;
+    // number of beam to select token
+    int n_beam = 4;
 
     // parse command line arguments
 
@@ -136,6 +135,8 @@ int main(int argc, char ** argv) {
                     print_usage(argc, argv);
                     return 1;
                 }
+            } else if (strcmp(argv[i], "-k") == 0) {
+                n_beam = std::stoi(argv[++i]);
             } else {
                 // prompt starts here
                 break;
@@ -194,12 +195,11 @@ int main(int argc, char ** argv) {
     // initialize the context
 
     llama_context_params ctx_params = llama_context_default_params();
-    // n_ctx is the context size
-    ctx_params.n_ctx                = n_prompt + n_predict;
-    // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
-    ctx_params.n_batch              = n_prompt + n_predict;
-    // enable performance counters
-    ctx_params.no_perf              = false;
+    ctx_params.n_seq_max = 2 * n_beam + 1;
+    ctx_params.kv_unified = true;
+    ctx_params.n_ctx     = n_prompt + 2 * n_beam * n_predict;  
+    ctx_params.n_batch   = std::max(n_prompt, n_beam);
+    ctx_params.no_perf   = false;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
 
@@ -245,9 +245,23 @@ int main(int argc, char ** argv) {
     const auto t_main_start = ggml_time_us();
     int        n_decode     = 0;
 
-    const int K = 4;
+    // 提示词只算一次，放进模板序列 0
+    std::vector<int> free_ids; 
+    for (int i = 1; i <= 2 * n_beam; ++i) {
+        free_ids.push_back(i);
+    }
+
+    llama_batch_ext_clear(batch);
+    batch_set_tokens(batch, prompt_tokens.data(), n_prompt, 0);
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) {
+        fprintf(stderr, "%s: error: llama_process failed\n", __func__);
+        return 1;
+    }
+    const float * root_logits = llama_get_logits_ith(ctx, -1);
+
+    // 虚拟的起点：一条内容为空、就绪位置是提示词末尾的路，序列号是 0 （模板）
     std::vector<beam> live;
-    live.push_back({ {}, "", 0.0, llama_sampler_clone(grmr) });
+    live.push_back({"", 0.0f, llama_sampler_clone(grmr), 0, n_prompt, root_logits});
     std::map<std::string, double> finished;     // 文字 -> 最高分
 
     struct cand {
@@ -257,14 +271,10 @@ int main(int argc, char ** argv) {
     };
 
     while (!live.empty()) {
+        // 用每条路【上一轮算好的 logits】产生候选
         std::vector<cand> pool;
         for (int b = 0; b < static_cast<int>(live.size()); ++b) {
-            const float * logits = eval_from_scratch(ctx, batch, prompt_tokens, live[b].toks);
-            if (logits == nullptr) {
-                fprintf(stderr, "%s: eval failed\n", __func__);
-                return 1;
-            }
-            n_decode += 1;
+            const float * logits = live[b].logits;
             const int n_vocab = llama_vocab_n_tokens(vocab);
 
             // 语法约束之前，先算每个 token 的 log 概率
@@ -290,61 +300,95 @@ int main(int argc, char ** argv) {
             llama_token_data_array arr = { cur.data(), cur.size(), -1, false };
             llama_sampler_apply(live[b].grmr, &arr);
 
-            // 允许的里面，按 lp 取前 K 个
+            // 允许的里面，按 lp 取前 k 个
             std::vector<std::pair<double, llama_token>> ok;
             for (int j = 0; j < static_cast<int>(arr.size); ++j) {
                 if (arr.data[j].logit != -INFINITY) {
-                    ok.push_back({ lp[arr.data[j].id], arr.data[j].id});
+                    ok.push_back({ lp[arr.data[j].id], arr.data[j].id });
                 }
             }
-            const int n_ok = std::min<int>(K, ok.size());
-            std::partial_sort(ok.begin(), ok.begin() + n_ok, ok.end(),
-                              [](const auto & x, const auto & y) {
-                                return x.first > y.first;
-                              });
+            const int n_ok = std::min<int>(n_beam, ok.size());
+            std::partial_sort(ok.begin(), ok.begin() + n_ok, ok.end(), [](const auto & x, const auto & y) {
+                return x.first > y.first; 
+            });
             for (int j = 0; j < n_ok; ++j) {
-                pool.push_back({ live[b].score + ok[j].first, b, ok[j].second });
+                pool.push_back({live[b].score + ok[j].first, b, ok[j].second });
             }
         }
 
-        // 所有路的候选合在一起，按总分排序
-        std::sort(pool.begin(), pool.end(), 
-                  [](const cand & x, const cand & y) { 
-                    return x.score > y.score; 
-                });
-
+        std::sort(pool.begin(), pool.end(), [](const cand & x, const cand & y) {
+            return x.score > y.score; 
+        });
+        
+        // 只给活下来的 K 个建新序列
         std::vector<beam> next;
-        for (int c = 0; c < std::min<int>(K, pool.size()); ++c) {
+        std::vector<int32_t> batch_ids;
+
+        llama_memory_t mem = llama_get_memory(ctx);
+        llama_batch_ext_clear(batch);
+        for (int c = 0; c < std::min<int>(n_beam, pool.size()); ++c) {
             const beam & p = live[pool[c].parent];
             if (llama_vocab_is_eog(vocab, pool[c].tok)) {
+                // 进 finished（按文字去重留高分），不建新路、不占序列
                 auto it = finished.find(p.text);
                 if (it == finished.end() || it->second < pool[c].score) {
                     finished[p.text] = pool[c].score;
                 }
-            } else {
-                beam nb;
-                nb.toks = p.toks;
-                nb.toks.push_back(pool[c].tok);
-                char buf[128];
-                const int n = llama_token_to_piece(vocab, pool[c].tok, buf, sizeof(buf), 0, true);
-                nb.text = p.text + std::string(buf, n);
-                nb.score = pool[c].score;
-                nb.grmr = llama_sampler_clone(p.grmr);
-                llama_sampler_accept(nb.grmr, pool[c].tok);
-                next.push_back(std::move(nb));
+                continue;
+            }
+            // 给子路分一个空闲序列，把父路的全部记忆（提示词 + 父路已写的 token）挂过来
+            const llama_seq_id id = free_ids.back();
+            free_ids.pop_back();
+            llama_memory_seq_rm(mem, id, -1, -1);
+            llama_memory_seq_cp(mem, p.seq, id, -1, -1);
+
+            // 只把这一步新选的 token 放进 batch，位置接在父路后面
+            const int32_t idx = batch_add_one(batch, id, pool[c].tok, p.next_pos);
+            if (idx < 0) {
+                fprintf(stderr, "%s: error: batch is full\n", __func__);
+                return 1;
+            }
+            batch_ids.push_back(idx);
+
+            char buf[128];
+            const int n = llama_token_to_piece(vocab, pool[c].tok, buf, sizeof(buf), 0, true);
+            beam nb;
+            nb.text = p.text + std::string(buf, n);
+            nb.score = pool[c].score;
+            nb.grmr = llama_sampler_clone(p.grmr);
+            llama_sampler_accept(nb.grmr, pool[c].tok);
+            nb.seq = id;
+            nb.next_pos = p.next_pos + 1;
+            nb.logits = nullptr; // 下面算完再填
+            next.push_back(nb);
+        }
+
+        // 所有子路的新 token 放在同一个 batch 里，一次算完
+        if (!batch_ids.empty()) {
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) {
+                fprintf(stderr, "%s: error: llama_process failed\n", __func__);
+                return 1;
+            }
+            n_decode += batch_ids.size();
+            for (int j = 0; j < static_cast<int>(next.size()); ++j) {
+                next[j].logits = llama_get_logits_ith(ctx, batch_ids[j]);
             }
         }
 
+        // 父路用完了：语法状态销毁，序列清空、编号还回池子（模板序列 0 一直保留）
         for (auto & b : live) {
             llama_sampler_free(b.grmr);
+            if (b.seq != 0) {
+                llama_memory_seq_rm(mem, b.seq, -1, -1);
+                free_ids.push_back(b.seq);
+            }
         }
         live = std::move(next);
     }
 
-    // 打印前 K 个已完成的
     std::vector<std::pair<std::string, double>> out(finished.begin(), finished.end());
-    std::sort(out.begin(), out.end(), [](const auto & x, const auto & y) {return x.second > y.second; });
-    for (int i = 0; i < static_cast<int>(out.size()) && i < static_cast<int>(K); ++i) {
+    std::sort(out.begin(), out.end(), [](const auto & x, const auto & y) { return x.second > y.second; });
+    for (int i = 0; i < static_cast<int>(out.size()) && i < n_beam; ++i) {
         printf("%s\t%.2f\n", out[i].first.c_str(), out[i].second);
     }
 
