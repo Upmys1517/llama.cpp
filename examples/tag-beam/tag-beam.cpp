@@ -5,11 +5,36 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 #include <map>
+
+// 名字和 TAG 只含中文/大写字母/数字，这里只是不信任输入地做一次转义
+static std::string json_escape(const std::string & s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
+}
 
 // fill the batch with tokens at consecutive positions starting from pos_0, output logits only for the last one
 static void batch_set_tokens(llama_batch_ext * batch, const llama_token * tokens, int32_t n_tokens, llama_pos pos_0) {
@@ -99,6 +124,8 @@ int main(int argc, char ** argv) {
     int         n_predict = 32;
     // number of beam to select token
     int n_beam = 4;
+    // 常驻模式：从 stdin 逐行读中文名，每行回一条 JSON；模型、词表、前缀只准备一次
+    bool serve = false;
 
     // parse command line arguments
 
@@ -138,6 +165,8 @@ int main(int argc, char ** argv) {
                 }
             } else if (strcmp(argv[i], "-k") == 0) {
                 n_beam = std::stoi(argv[++i]);
+            } else if (strcmp(argv[i], "--serve") == 0) {
+                serve = true;
             } else {
                 // prompt starts here
                 break;
@@ -150,7 +179,7 @@ int main(int argc, char ** argv) {
         for(; i < argc; ++i) {
             words.push_back(argv[i]);
         }
-        if (words.empty()) {
+        if (!serve && words.empty()) {
             print_usage(argc, argv);
             return 1;
         }
@@ -174,45 +203,61 @@ int main(int argc, char ** argv) {
 
     // 把命令行输入的中文当作 user 消息，套上聊天模板
     const std::string  sys = "把中文测试场景名翻译成英文 TAG：只用大写字母和数字，不超过 16 个字符。只输出 TAG。";
-    std::vector<std::vector<llama_token>> prompts;
-    for (const auto & w : words) {
-        std::string p = format_chat(
-            model,
-            {
-                {
-                    "system",
-                    sys
-                },
-                {
-                    "user",
-                    w
-                }
-            }
-        );
+
+    // 提示词 = 固定的 system + 中文名，公共前缀就是 system 那一段
+    auto tokenize_prompt = [&](const std::string & w, std::vector<llama_token> & out) -> bool {
+        const std::string p = format_chat(model, {{"system", sys}, {"user", w}});
         const int n = -llama_tokenize(vocab, p.c_str(), p.size(), NULL, 0, true, true);
-        std::vector<llama_token> t(n);
-        if (llama_tokenize(vocab, p.c_str(), p.size(), t.data(), t.size(), true, true) < 0) {
+        if (n <= 0) {
+            return false;
+        }
+        out.resize(n);
+        return llama_tokenize(vocab, p.c_str(), p.size(), out.data(), out.size(), true, true) >= 0;
+    };
+
+    std::vector<std::vector<llama_token>> prompts;
+    std::vector<llama_token>             prefix;   // 解码进 seq 0、所有名字共用的开头
+
+    if (serve) {
+        // 两个不同的占位名字求出公共前缀，之后每个名字只解码自己的尾段
+        std::vector<llama_token> a, b;
+        if (!tokenize_prompt("甲", a) || !tokenize_prompt("乙乙乙", b)) {
             fprintf(stderr, "%s: error: failed to tokenize\n", __func__);
             return 1;
         }
-        prompts.push_back(std::move(t));
-    }
-
-    // 所有词的提示词在分词后共有的开头长度（不能靠字符串切分，分词可能跨边界合并）
-    size_t common = prompts[0].size();
-    for (const auto & t : prompts) {
         size_t i = 0;
-        while (i < common && i < t.size() && t[i] == prompts[0][i]) {
+        while (i < a.size() && i < b.size() && a[i] == b[i]) {
             ++i;
         }
-        common = i;
-    }
-    if (prompts.size() == 1) {
-        common = 0;     // 只有一个词时没有可复用的前缀，整段算
-    }
-    fprintf(stderr, "%s: %zu prompts, common prefix = %zu tokens\n", __func__, prompts.size(), common);
+        prefix.assign(a.begin(), a.begin() + i);
+    } else {
+        for (const auto & w : words) {
+            std::vector<llama_token> t;
+            if (!tokenize_prompt(w, t)) {
+                fprintf(stderr, "%s: error: failed to tokenize\n", __func__);
+                return 1;
+            }
+            prompts.push_back(std::move(t));
+        }
 
-    size_t max_len = 0;
+        // 所有词的提示词在分词后共有的开头长度（不能靠字符串切分，分词可能跨边界合并）
+        size_t common = prompts[0].size();
+        for (const auto & t : prompts) {
+            size_t i = 0;
+            while (i < common && i < t.size() && t[i] == prompts[0][i]) {
+                ++i;
+            }
+            common = i;
+        }
+        if (prompts.size() == 1) {
+            common = 0;     // 只有一个词时没有可复用的前缀，整段算
+        }
+        prefix.assign(prompts[0].begin(), prompts[0].begin() + common);
+    }
+    const size_t common = prefix.size();
+    fprintf(stderr, "%s: common prefix = %zu tokens, %zu prompts\n", __func__, common, prompts.size());
+
+    size_t max_len = common + 64;   // 常驻模式下来一个名字现算，按最短可用来估
     for (const auto & t : prompts) {
         max_len = std::max(max_len, t.size());
     }
@@ -286,42 +331,52 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "%s: tag vocab = %zu / %d tokens\n", __func__, tag_vocab.size(), n_vocab);
 
-    // 公共前缀只算一次放进 seq 0；每个词把自己的独有部分接在它后面
+    // 词表约束做成 sampler：集合之外的 token 直接掩成 -inf，和语法约束串在一条链上
+    llama_sampler * subset = llama_sampler_init_vocab_subset(vocab, tag_vocab.data(), tag_vocab.size());
+
+    // 每条 beam 每一步都要重建候选，只在外面分配一次
+    std::vector<llama_token_data> cur(n_vocab);
+
+    // 公共前缀只算一次放进 seq 0；每个名字把自己的独有部分接在它后面
     if (common > 0) {
         llama_batch_ext_clear(batch);
-        batch_set_tokens(batch, prompts[0].data(), static_cast<int>(common), 0);
+        batch_set_tokens(batch, prefix.data(), static_cast<int>(common), 0);
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) {
             fprintf(stderr, "%s: error: llama_process failed (prefix)\n", __func__);
             return 1;
         }
+        n_decode += static_cast<int>(common);
     }
 
-    for (size_t w = 0; w < prompts.size(); ++w) {
-        const std::vector<llama_token> & pt = prompts[w];
-        if (pt.size() <= common) {
-            fprintf(stderr, "%s: skip duplicate %s\n", __func__, words[w].c_str());
-            continue;
-        }
+    // 跑一个名字：尾段接在公共前缀后面，做 beam search，返回按分数降序的候选
+    auto run_word = [&](const std::vector<llama_token> & pt,
+                        std::vector<std::pair<std::string, double>> & out) -> bool {
+        // 提示词前 common 个 token 和 seq 0 里的前缀不一致时不能复用，整段重算
+        const bool reuse = common > 0 && pt.size() >= common &&
+            std::equal(prefix.begin(), prefix.end(), pt.begin());
+        const size_t from = reuse ? common : 0;
 
-        // 借一个序列，装「公共前缀 + 这个词独有的 token」
+        // 借一个序列，装「公共前缀（拷过来）+ 这个名字独有的 token」
         const llama_seq_id wid = free_ids.back();
         free_ids.pop_back();
         llama_memory_seq_rm(mem, wid, -1, -1);
-        llama_memory_seq_cp(mem, 0, wid, -1, -1);
+        if (reuse) {
+            llama_memory_seq_cp(mem, 0, wid, -1, -1);
+        }
 
         llama_batch_ext_clear(batch);
-        for (size_t i = common; i < pt.size(); ++i) {
+        for (size_t i = from; i < pt.size(); ++i) {
             const int32_t idx = batch_add_one(batch, wid, pt[i], static_cast<llama_pos>(i), i + 1 == pt.size());
             if (idx < 0) {
                 fprintf(stderr, "%s: error: batch is full\n", __func__);
-                return 1;
+                return false;
             }
         }
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) {
             fprintf(stderr, "%s: error: llama_process failed (word)\n", __func__);
-            return 1;
+            return false;
         }
-        n_decode += static_cast<int>(pt.size() - common);
+        n_decode += static_cast<int>(pt.size() - from);
 
         // 起点：一条内容为空、就绪位置是这个词提示词末尾的路
         std::vector<beam> live;
@@ -346,13 +401,12 @@ int main(int argc, char ** argv) {
                 }
                 const double log_sum = std::log(sum);
 
-                // 用这条路自己的语法状态筛掉违规 token
-                std::vector<llama_token_data> cur(tag_vocab.size());
-                for (int i = 0; i < static_cast<int>(tag_vocab.size()); ++i) {
-                    const llama_token id = tag_vocab[i];
-                    cur[i] = { id, logits[id], 0.0f };
+                // 先按词表掩码，再用这条路自己的语法状态筛掉违规 token
+                for (int i = 0; i < n_vocab; ++i) {
+                    cur[i] = { i, logits[i], 0.0f };
                 }
                 llama_token_data_array arr = { cur.data(), cur.size(), -1, false };
+                llama_sampler_apply(subset, &arr);
                 llama_sampler_apply(live[b].grmr, &arr);
 
                 // 允许的里面，按 lp 取前 k 个
@@ -439,14 +493,61 @@ int main(int argc, char ** argv) {
             live = std::move(next);
         }
 
-        // 每个词单独打印：第一行是词，后面是它的候选
-        printf("%s\n", words[w].c_str());
-        std::vector<std::pair<std::string, double>> out(finished.begin(), finished.end());
+        out.assign(finished.begin(), finished.end());
         std::sort(out.begin(), out.end(), [](const auto & x, const auto & y) { return x.second > y.second; });
-        for (int i = 0; i < static_cast<int>(out.size()) && i < n_beam; ++i) {
-            printf("%s\t%.2f\n", out[i].first.c_str(), out[i].second);
+        if (out.size() > static_cast<size_t>(n_beam)) {
+            out.resize(n_beam);
         }
-        printf("\n");
+        return true;
+    };
+
+    if (serve) {
+        // 一行一个中文名，一行一条 JSON；调用方按行读，超时由调用方兜底
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+                line.pop_back();
+            }
+            if (line.empty()) {
+                continue;
+            }
+            std::vector<llama_token> pt;
+            std::vector<std::pair<std::string, double>> out;
+            const char * err = nullptr;
+            if (!tokenize_prompt(line, pt)) {
+                err = "tokenize";
+            } else if (!run_word(pt, out)) {
+                err = "decode";
+            }
+            if (err) {
+                printf("{\"name\":\"%s\",\"error\":\"%s\"}\n", json_escape(line).c_str(), err);
+            } else {
+                printf("{\"name\":\"%s\",\"candidates\":[", json_escape(line).c_str());
+                for (size_t i = 0; i < out.size(); ++i) {
+                    printf("%s{\"tag\":\"%s\",\"score\":%.4f}", i ? "," : "",
+                           json_escape(out[i].first).c_str(), out[i].second);
+                }
+                printf("]}\n");
+            }
+            fflush(stdout);
+        }
+    } else {
+        for (size_t w = 0; w < prompts.size(); ++w) {
+            if (common > 0 && prompts[w].size() <= common) {
+                fprintf(stderr, "%s: skip duplicate %s\n", __func__, words[w].c_str());
+                continue;
+            }
+            std::vector<std::pair<std::string, double>> out;
+            if (!run_word(prompts[w], out)) {
+                return 1;
+            }
+            // 每个词单独打印：第一行是词，后面是它的候选
+            printf("%s\n", words[w].c_str());
+            for (const auto & c : out) {
+                printf("%s\t%.2f\n", c.first.c_str(), c.second);
+            }
+            printf("\n");
+        }
     }
 
     const auto t_main_end = ggml_time_us();
@@ -460,6 +561,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "\n");
 
     llama_batch_ext_free(batch);
+    llama_sampler_free(subset);
     llama_sampler_free(smpl);
     llama_sampler_free(grmr);
     llama_free(ctx);
