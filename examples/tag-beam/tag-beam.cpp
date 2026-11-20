@@ -270,13 +270,31 @@ int main(int argc, char ** argv) {
         llama_token tok;     // 这一步选的 token
     };
 
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    // 能出现在 TAG 里的
+    std::vector<llama_token> tag_vocab;
+    for (llama_token id = 0; id < n_vocab; ++id) {
+        if (llama_vocab_is_eog(vocab, id)) {
+            tag_vocab.push_back(id);
+            continue;
+        }
+        char buf[128];
+        const int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, false);
+        bool ok_chars = (n > 0);
+        for (int i = 0; i < n && ok_chars; ++i) {
+            ok_chars = (buf[i] >= 'A' && buf[i] <= 'Z') || (buf[i] >= '0' && buf[i] <= '9');
+        }
+        if (ok_chars) {
+            tag_vocab.push_back(id);
+        }
+    }
+    fprintf(stderr, "%s: tag vocab = %zu / %d tokens\n", __func__, tag_vocab.size(), n_vocab);
     while (!live.empty()) {
         // 用每条路【上一轮算好的 logits】产生候选
         std::vector<cand> pool;
         for (int b = 0; b < static_cast<int>(live.size()); ++b) {
             const float * logits = live[b].logits;
-            const int n_vocab = llama_vocab_n_tokens(vocab);
-
+            
             // 语法约束之前，先算每个 token 的 log 概率
             float max_l = logits[0];
             for (int i = 1; i < n_vocab; ++i) {
@@ -287,15 +305,12 @@ int main(int argc, char ** argv) {
                 sum += std::exp(logits[i] - max_l);
             }
             const double log_sum = std::log(sum);
-            std::vector<double> lp(n_vocab);
-            for (int i = 0; i < n_vocab; ++i) {
-                lp[i] = logits[i] - max_l - log_sum;
-            }
 
             // 用这条路自己的语法状态筛掉违规 token
-            std::vector<llama_token_data> cur(n_vocab);
-            for (int i = 0; i < n_vocab; ++i) {
-                cur[i] = { i, logits[i], 0.0f };
+            std::vector<llama_token_data> cur(tag_vocab.size());
+            for (int i = 0; i < static_cast<int>(tag_vocab.size()); ++i) {
+                const llama_token id = tag_vocab[i];
+                cur[i] = { id, logits[id], 0.0f };
             }
             llama_token_data_array arr = { cur.data(), cur.size(), -1, false };
             llama_sampler_apply(live[b].grmr, &arr);
@@ -304,7 +319,8 @@ int main(int argc, char ** argv) {
             std::vector<std::pair<double, llama_token>> ok;
             for (int j = 0; j < static_cast<int>(arr.size); ++j) {
                 if (arr.data[j].logit != -INFINITY) {
-                    ok.push_back({ lp[arr.data[j].id], arr.data[j].id });
+                    const llama_token id = arr.data[j].id;
+                    ok.push_back({ static_cast<double>(logits[id]) - max_l - log_sum, id });
                 }
             }
             const int n_ok = std::min<int>(n_beam, ok.size());
