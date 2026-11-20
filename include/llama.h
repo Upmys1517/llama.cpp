@@ -1523,6 +1523,18 @@ extern "C" {
                                float   tau,
                                float   eta);
 
+    /// @details Restrict sampling to an explicit set of token ids: candidates outside `tokens`
+    /// get their logit set to -inf. Useful when the valid outputs are known ahead of time
+    /// (fixed labels, enum values, keyword lists), where it removes the per-candidate string
+    /// reconstruction that a grammar sampler needs.
+    /// @param vocab The vocabulary the tokens belong to. Ids outside [0, llama_vocab_n_tokens(vocab))
+    /// are dropped, as are duplicates.
+    /// An empty set (or a NULL `tokens`) makes this a noop, consistent with llama_sampler_init_top_k.
+    LLAMA_API struct llama_sampler * llama_sampler_init_vocab_subset(
+            const struct llama_vocab * vocab,
+                     const llama_token * tokens,
+                                  size_t   n_tokens);
+
     /// @details Initializes a GBNF grammar, see grammars/README.md for details.
     /// @param vocab The vocabulary that this grammar will be used with.
     /// @param grammar_str The production rules for the grammar, encoded as a string. Returns an empty grammar if empty. Returns NULL if parsing of grammar_str fails.

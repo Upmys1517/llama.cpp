@@ -1450,6 +1450,12 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
     candidates_grammar.reserve(cur_p->size);
 
     for (size_t i = 0; i < cur_p->size; ++i) {
+        // an earlier sampler in the chain may already have ruled this token out; skip the
+        // piece decoding for it, which is the expensive part of this loop
+        if (cur_p->data[i].logit == -INFINITY) {
+            continue;
+        }
+
         const llama_token id      = cur_p->data[i].id;
         const std::string & piece = grammar.vocab->token_to_piece(id);
 
