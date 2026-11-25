@@ -1539,6 +1539,104 @@ struct llama_sampler * llama_sampler_init_top_k(int32_t k) {
     );
 }
 
+// vocab-subset
+//
+// Restrict sampling to an explicit set of token ids. Callers that already know the
+// closed set of valid outputs (fixed labels, enum values, keyword lists) can use this
+// to make it impossible for decoding to leave that set, without the per-candidate
+// string reconstruction that grammar sampling has to do.
+
+struct llama_sampler_vocab_subset : public llama_sampler_backend {
+    std::vector<llama_token> allowed; // sorted, unique
+
+    explicit llama_sampler_vocab_subset(std::vector<llama_token> allowed)
+        : llama_sampler_backend("vocab-subset")
+        , allowed(std::move(allowed)) {
+    }
+};
+
+static struct llama_sampler * llama_sampler_init_vocab_subset_impl(std::vector<llama_token> allowed);
+
+static const char * llama_sampler_vocab_subset_name(const struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_vocab_subset *) smpl->ctx;
+    return ctx->get_name();
+}
+
+static void llama_sampler_vocab_subset_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    auto * ctx = (llama_sampler_vocab_subset *) smpl->ctx;
+
+    bool masked = false;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        if (!std::binary_search(ctx->allowed.begin(), ctx->allowed.end(), cur_p->data[i].id)) {
+            cur_p->data[i].logit = -INFINITY;
+            masked = true;
+        }
+    }
+
+    if (masked) {
+        cur_p->sorted = false;
+    }
+}
+
+static struct llama_sampler * llama_sampler_vocab_subset_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const llama_sampler_vocab_subset *) smpl->ctx;
+    return llama_sampler_init_vocab_subset_impl(ctx->allowed);
+}
+
+static void llama_sampler_vocab_subset_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_vocab_subset *) smpl->ctx;
+}
+
+static struct llama_sampler_i llama_sampler_vocab_subset_i = {
+    /* .name              = */ llama_sampler_vocab_subset_name,
+    /* .accept            = */ nullptr,
+    /* .apply             = */ llama_sampler_vocab_subset_apply,
+    /* .reset             = */ nullptr,
+    /* .clone             = */ llama_sampler_vocab_subset_clone,
+    /* .free              = */ llama_sampler_vocab_subset_free,
+    /* .backend_init      = */ nullptr,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ nullptr,
+    /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ nullptr,
+};
+
+static struct llama_sampler * llama_sampler_init_vocab_subset_impl(std::vector<llama_token> allowed) {
+    if (allowed.empty()) {
+        return llama_sampler_init_empty("?vocab-subset");
+    }
+
+    return llama_sampler_init(
+        /* .iface = */ &llama_sampler_vocab_subset_i,
+        /* .ctx   = */ new llama_sampler_vocab_subset(std::move(allowed))
+    );
+}
+
+struct llama_sampler * llama_sampler_init_vocab_subset(
+        const struct llama_vocab * vocab,
+                 const llama_token * tokens,
+                              size_t   n_tokens) {
+    if (vocab == nullptr || tokens == nullptr || n_tokens == 0) {
+        return llama_sampler_init_empty("?vocab-subset");
+    }
+
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+    std::vector<llama_token> allowed;
+    allowed.reserve(n_tokens);
+    for (size_t i = 0; i < n_tokens; ++i) {
+        if (tokens[i] >= 0 && tokens[i] < n_vocab) {
+            allowed.push_back(tokens[i]);
+        }
+    }
+
+    std::sort(allowed.begin(), allowed.end());
+    allowed.erase(std::unique(allowed.begin(), allowed.end()), allowed.end());
+
+    return llama_sampler_init_vocab_subset_impl(std::move(allowed));
+}
+
 // top-p
 
 struct llama_sampler_top_p : public llama_sampler_backend {
